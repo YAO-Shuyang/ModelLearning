@@ -1,53 +1,15 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
-from neuronav.envs.graph_env import GraphObservation
+from typing import Dict, List, Optional
 
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
 
-from dataclasses import dataclass
-from typing import Any, Dict, Optional, Tuple
+from rtrv_models.RL.log import TrainMonitor
 
-import gymnasium as gym
-
-
-@dataclass
-class ResetOut:
-    """Reset output container."""
-    obs: Any
-    info: Dict[str, Any]
-
-
-class OldGymAPIWrapper(gym.Wrapper):
-    """Wrap a Gymnasium env to expose old Gym-style API.
-
-    This wrapper converts:
-    - reset() -> obs  (drops info)
-    - step()  -> (obs, reward, done, info)
-
-    Parameters
-    ----------
-    env
-        A Gymnasium environment.
-
-    """
-    def __init__(self, env: gym.Env) -> None:
-        super().__init__(env)
-
-    def reset(self, **kwargs) -> Any:
-        """Reset and return obs only (old Gym API)."""
-        obs, info = self.env.reset(**kwargs)
-        return obs
-
-    def step(self, action: int) -> Tuple[Any, float, bool, Dict[str, Any]]:
-        """Step and return (obs, reward, done, info)."""
-        obs, r, term, trunc, info = self.env.step(action)
-        done = bool(term or trunc)
-        return obs, float(r), done, info
 
 @dataclass
 class Transition:
@@ -57,6 +19,16 @@ class Transition:
     r: float
     s2: int
     done: bool
+
+
+@dataclass
+class TransitionBatch:
+    """A minibatch of transitions."""
+    s: np.ndarray
+    a: np.ndarray
+    r: np.ndarray
+    s2: np.ndarray
+    done: np.ndarray
 
 
 class ReplayBuffer:
@@ -98,16 +70,6 @@ class ReplayBuffer:
         return TransitionBatch(s=s, a=a, r=r, s2=s2, done=d)
 
 
-@dataclass
-class TransitionBatch:
-    """A minibatch of transitions."""
-    s: np.ndarray
-    a: np.ndarray
-    r: np.ndarray
-    s2: np.ndarray
-    done: np.ndarray
-
-
 class QNet(nn.Module):
     """Embedding-based Q-network for discrete state indices.
 
@@ -141,25 +103,13 @@ class QNet(nn.Module):
         )
 
     def forward(self, s: torch.Tensor) -> torch.Tensor:
-        """Compute Q(s, ·) for a batch of states.
-
-        Parameters
-        ----------
-        s
-            Long tensor of shape (B,) containing state indices.
-
-        Returns
-        -------
-        q
-            Float tensor of shape (B, n_actions).
-
-        """
+        """Compute Q(s, ·) for a batch of states."""
         z = self.emb(s)
         return self.mlp(z)
 
 
 class DQNAgent:
-    """DQN agent for Neuro-Nav graph tasks.
+    """Double DQN agent for Neuro-Nav graph tasks.
 
     Parameters
     ----------
@@ -175,6 +125,12 @@ class DQNAgent:
         Polyak averaging factor. If 1.0, do hard copy.
     device
         Torch device string.
+
+    Notes
+    -----
+    This implements Double DQN targets:
+    a* = argmax_a Q_online(s', a)
+    y  = r + (1-done)*gamma*Q_target(s', a*)
 
     """
     def __init__(
@@ -197,31 +153,56 @@ class DQNAgent:
         self.q_tgt.load_state_dict(self.q.state_dict())
         self.q_tgt.eval()
 
-        self.opt = optim.Adam(self.q.parameters(), lr=lr)
+        self.opt = optim.Adam(self.q.parameters(), lr=float(lr))
 
     @torch.no_grad()
-    def act(self, s: int, eps: float) -> int:
-        """Epsilon-greedy action selection."""
-        if np.random.rand() < eps:
-            return int(np.random.randint(self.n_actions))
-        st = torch.tensor([s], dtype=torch.long, device=self.device)
-        q = self.q(st)[0]
-        return int(torch.argmax(q).item())
-
-    def update(self, batch: TransitionBatch) -> float:
-        """One DQN update step.
+    def act(self, s: int, eps: float, env=None) -> int:
+        """Epsilon-greedy with illegal-action masking + random tie-break.
 
         Parameters
         ----------
-        batch
-            Minibatch of transitions.
+        s
+            Current state index.
+        eps
+            Exploration probability.
+        env
+            Optional env exposing env.edges for legality masking. We treat
+            an action as illegal if env.edges[s][a] == s (self-loop).
 
         Returns
         -------
-        loss_value
-            Scalar loss as float.
+        a
+            Selected action index.
 
         """
+        s = int(s)
+
+        st = torch.tensor([s], dtype=torch.long, device=self.device)
+        q = self.q(st)[0].detach().cpu().numpy()
+
+        if env is not None:
+            q = q.copy()
+            for a in range(self.n_actions):
+                if int(env.edges[s][a]) == s:
+                    q[a] = -np.inf
+
+        # If all actions are illegal (should be rare), fall back.
+        if not np.isfinite(np.max(q)):
+            return int(np.random.randint(self.n_actions))
+
+        # Exploration: random legal action.
+        if np.random.rand() < float(eps):
+            legal = np.flatnonzero(np.isfinite(q))
+            return int(np.random.choice(legal))
+
+        # Exploitation: random tie-break among best legal actions.
+        q = q + np.random.randn(q.shape[0]).astype(np.float32) * 1e-6
+        m = np.max(q)
+        best = np.flatnonzero(np.isclose(q, m))
+        return int(np.random.choice(best))
+
+    def update(self, batch: TransitionBatch) -> float:
+        """One Double DQN update step."""
         s = torch.tensor(batch.s, dtype=torch.long, device=self.device)
         a = torch.tensor(batch.a, dtype=torch.long, device=self.device)
         r = torch.tensor(batch.r, dtype=torch.float32, device=self.device)
@@ -231,8 +212,10 @@ class DQNAgent:
         q_sa = self.q(s).gather(1, a[:, None]).squeeze(1)
 
         with torch.no_grad():
-            q2_max = self.q_tgt(s2).max(dim=1).values
-            y = r + (1.0 - d) * self.gamma * q2_max
+            # Double DQN: action selection by online network.
+            a2 = torch.argmax(self.q(s2), dim=1)
+            q2 = self.q_tgt(s2).gather(1, a2[:, None]).squeeze(1)
+            y = r + (1.0 - d) * self.gamma * q2
 
         loss = nn.functional.smooth_l1_loss(q_sa, y)
 
@@ -271,52 +254,18 @@ def train_dqn(
     eps_decay_steps: int = 100_000,
     max_ep_len: int = 2_000,
     device: str = "cpu",
+    log_every: int = 2000,
     seed: int = 0,
 ) -> Dict[str, np.ndarray]:
-    """Train DQN on a Neuro-Nav-like env with discrete state indices.
+    """Train Double DQN on a Neuro-Nav-like env with discrete states."""
+    np.random.seed(int(seed))
+    torch.manual_seed(int(seed))
 
-    Parameters
-    ----------
-    env
-        A Gym-like env. Must support reset(agent_pos=...) and step(a).
-        Observation must be an integer state index.
-    start_state
-        Oriented start state id.
-    n_steps
-        Total environment steps.
-    buffer_size
-        Replay buffer capacity.
-    warmup
-        Steps to fill buffer before training.
-    batch_size
-        Minibatch size.
-    train_every
-        Update frequency in environment steps.
-    target_tau
-        Target update: 1.0 for hard copy each update, <1 for Polyak.
-    gamma
-        Discount factor.
-    lr
-        Learning rate.
-    eps_start, eps_end
-        Epsilon schedule endpoints.
-    eps_decay_steps
-        Linear decay duration in steps.
-    max_ep_len
-        Episode truncation length.
-    device
-        Torch device.
-    seed
-        Random seed.
-
-    Returns
-    -------
-    logs
-        Dict containing arrays of episode returns and losses.
-
-    """
-    np.random.seed(seed)
-    torch.manual_seed(seed)
+    mon = TrainMonitor(
+        log_every=log_every,
+        ret_window=50,
+        loss_window=200,
+    )
 
     n_states = int(env.state_size)
     n_actions = int(env.action_space.n)
@@ -333,66 +282,66 @@ def train_dqn(
     ep_returns: List[float] = []
     losses: List[float] = []
 
-    s = int(env.reset(agent_pos=start_state))
+    s = int(env.reset(agent_pos=int(start_state)))
     ep_ret = 0.0
     ep_len = 0
 
-    for t in range(n_steps):
-        frac = min(1.0, t / max(1, eps_decay_steps))
-        eps = eps_start + frac * (eps_end - eps_start)
+    records: List[List[tuple]] = []
+    _rcds: List[tuple] = []
 
-        a = agent.act(s, eps=eps)
-        s2, r, done, info = env.step(a)
+    for t in range(int(n_steps)):
+        frac = min(1.0, t / max(1, int(eps_decay_steps)))
+        eps = float(eps_start + frac * (eps_end - eps_start))
+
+        a = agent.act(s, eps=eps, env=env)
+        s2, r, done, info = env.step(int(a))
         s2 = int(s2)
+
+        _rcds.append((int(s), int(s2), int(a), float(r)))
+        mon.add_transition(int(s), int(a), int(s2))
 
         ep_ret += float(r)
         ep_len += 1
 
-        tr = Transition(s=s, a=a, r=float(r), s2=s2, done=bool(done))
-        buf.push(tr)
+        buf.push(
+            Transition(
+                s=int(s),
+                a=int(a),
+                r=float(r),
+                s2=int(s2),
+                done=bool(done),
+            )
+        )
 
         s = s2
 
-        if done or ep_len >= max_ep_len:
-            ep_returns.append(ep_ret)
-            s = int(env.reset(agent_pos=start_state))
+        if bool(done) or ep_len >= int(max_ep_len):
+            ep_returns.append(float(ep_ret))
+            mon.add_episode(float(ep_ret), int(ep_len))
+            records.append(_rcds)
+            _rcds = []
+            s = int(env.reset(agent_pos=int(start_state)))
             ep_ret = 0.0
             ep_len = 0
 
-        if t >= warmup and (t % train_every == 0):
-            batch = buf.sample(batch_size)
-            loss = agent.update(batch)
-            losses.append(loss)
+        if len(buf) >= int(batch_size) and t >= int(warmup):
+            if (t % int(train_every)) == 0:
+                batch = buf.sample(int(batch_size))
+                loss = agent.update(batch)
+                losses.append(float(loss))
+                mon.add_loss(float(loss))
+
+        mon.maybe_log(
+            step=t + 1,
+            n_steps=int(n_steps),
+            eps=float(eps),
+            buf_len=len(buf),
+            lr=float(lr),
+        )
 
     logs = {
         "episode_return": np.asarray(ep_returns, dtype=np.float32),
         "loss": np.asarray(losses, dtype=np.float32),
+        "records": records,
     }
-    return logs
-
-if __name__ == "__main__":
-    import gymnasium as gym
-    from dsp_models.RL.graph import CustomGraphEnv, maze1_graph
-    from dsp_models.RL.utils import build_neuronav_objects_edges_start, MazeRewards
-    
-    # 2) Then run the builder
-    rewards = MazeRewards(goal_reward=1.0, dead_end_punish=-0.2)
-    objects, edges, s0 = build_neuronav_objects_edges_start(
-        maze1_graph,
-        start_node=1,
-        goal_node=144,
-        start_heading=1,
-        rewards=rewards,
-        width=12,
-    )
-    # Instantiate Neuro-Nav env with integer observations.
-    env0 = CustomGraphEnv(objects, edges, obs_type=GraphObservation.index)
-    env = OldGymAPIWrapper(env0)
-    logs = train_dqn(
-        env=env,
-        start_state=s0,
-        n_steps=200_000,
-        device="cuda" if torch.cuda.is_available() else "cpu",
-    )
-    print("Episodes:", len(logs["episode_return"]))
-    print("Last 10 returns:", logs["episode_return"][-10:])
+    return logs, agent, records
