@@ -8,7 +8,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 
-from rtrv_models.RL.log import TrainMonitor
+from rtrv_models.DQN4Maze.log import TrainMonitor
 
 
 @dataclass
