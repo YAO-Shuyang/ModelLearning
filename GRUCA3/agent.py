@@ -13,310 +13,298 @@ import torch.nn.functional as F
 # Constants / conventions
 # -----------------------------
 NXBIN = 12
-NYBIN = 12
-N_NODES = 288
+NYBIN = 24          # 12x24 = 288 bins total (your N_NODES=288)
+N_POS = NXBIN * NYBIN
 
-# Ego-actions:
-#  0: Left, 1: Forward, 2: Right, 3: Backward
-# We will map:
-#  -1 -> SOS token
-#  0..3 -> actions
-#  PAD -> padding for batching
+# ego tokens
 SOS_TOKEN = 4
 PAD_TOKEN = 5
-N_TOKENS = 7  # {0,1,2,3,SOS,PAD}
+N_TOKENS = 6        # {0,1,2,3,SOS,PAD}
 
+# position tokens: 0..287 are valid positions, 288 is PAD
+PAD_POS_TOKEN = N_POS
+N_POS_TOKENS = N_POS + 1
+
+IGNORE_INDEX = -100
+
+
+# -----------------------------
+# Helpers: (node id) <-> (x,y)
+# -----------------------------
+def node_to_xy(node: int) -> Tuple[int, int]:
+    """1-based node id in [1..288] -> integer (x,y) with y in [0..23]."""
+    if node < 1 or node > N_POS:
+        raise ValueError(f"node must be in [1,{N_POS}], got {node}")
+    x = (node - 1) % NXBIN
+    y = (node - 1) // NXBIN
+    return int(x), int(y)
+
+def xy_to_pos_id(x: int, y: int) -> int:
+    """(x,y) -> flattened position id in [0..287]."""
+    if not (0 <= x < NXBIN and 0 <= y < NYBIN):
+        raise ValueError(f"(x,y) out of bounds: {(x,y)}")
+    return int(y * NXBIN + x)
+
+def pos_id_to_xy(pos_id: int) -> Tuple[int, int]:
+    """flattened id in [0..287] -> (x,y)."""
+    if pos_id < 0 or pos_id >= N_POS:
+        raise ValueError(f"pos_id must be in [0,{N_POS-1}], got {pos_id}")
+    x = pos_id % NXBIN
+    y = pos_id // NXBIN
+    return int(x), int(y)
+
+def nodes_to_pos_ids(nodes: np.ndarray) -> np.ndarray:
+    """nodes: 1..288 -> pos_ids: 0..287"""
+    nodes = np.asarray(nodes, dtype=np.int64)
+    if np.any(nodes < 1) or np.any(nodes > N_POS):
+        raise ValueError(f"Nodes must be in [1,{N_POS}]")
+    return (nodes - 1).astype(np.int64)
 
 def sanitize_ego_tokens(ego_actions: np.ndarray) -> np.ndarray:
     """
-    Convert ego-action array into token ids in {0,1,2,3,SOS,PAD}.
-
-    Rules:
-      -1 -> SOS_TOKEN
+    Map ego actions to tokens:
+      -1 -> SOS
       0..3 -> unchanged
-      PAD_TOKEN is allowed (for already-padded sequences)
+      PAD_TOKEN allowed
     """
     a = np.asarray(ego_actions, dtype=np.int64)
     a = np.where(a == -1, SOS_TOKEN, a)
 
-    allowed = {0, 1, 2, 3, 6, SOS_TOKEN, PAD_TOKEN}
-    # vectorized membership check
+    allowed = {0, 1, 2, 3, SOS_TOKEN, PAD_TOKEN}
     ok = np.isin(a, list(allowed))
     if not np.all(ok):
         bad = a[~ok]
         raise ValueError(f"Found invalid ego tokens: {bad[:10]}")
     return a
 
-def check_nodes(nodes: np.ndarray) -> np.ndarray:
-    nodes = np.asarray(nodes, dtype=np.int64)
-    if np.any(nodes < 1) or np.any(nodes > N_NODES*2):
-        raise ValueError("Nodes must be in [1,288].")
-    return nodes
-
 
 # -----------------------------
-# CA3 Belief Model
+# CA3 belief model with (x,y) cue input
 # -----------------------------
-class CA3BeliefAgent(nn.Module):
+class CA3XYBeliefAgent(nn.Module):
     """
-    CA3-like recurrent belief model:
-      input tokens: (B,T) in {0,1,2,3,SOS,PAD}
-      recurrent core: GRU
-      output: node logits (B,T,144) => belief = softmax over nodes
+    Inputs:
+      - ego_tokens: (B,T) in {0,1,2,3,SOS,PAD}
+      - pos_tokens: (B,T) in {0..287, PAD_POS_TOKEN}, where typically only t=0 is provided:
+            pos_tokens[:,0] = pos_id(x0,y0)
+            pos_tokens[:,1:] = PAD_POS_TOKEN
 
-    Notes:
-    - We do NOT need explicit heading or start node for training if your training
-      always uses the same start cue token at t=0 (SOS).
-    - For retrieval mismatch experiments, we can "mis-cue" by swapping the SOS embedding
-      to a different learned cue embedding (see cue_id argument).
+    Output:
+      - logits over positions: (B,T,288)
+        belief grid = softmax(logits).reshape(B,T,NYBIN,NXBIN)
     """
 
     def __init__(
         self,
-        token_embed_dim: int = 32,
+        ego_embed_dim: int = 32,
+        pos_embed_dim: int = 32,
         ca3_hidden_dim: int = 128,
         num_gru_layers: int = 1,
         dropout: float = 0.0,
-        n_cues: int = 1,
     ) -> None:
-        """
-        n_cues:
-          number of distinct start-cue embeddings you want available.
-          If you set n_cues > 1, you can do mismatch retrieval by choosing cue_id != 0 at test time.
-          Training typically uses cue_id=0 always.
-        """
         super().__init__()
-        self.token_emb = nn.Embedding(N_TOKENS, token_embed_dim)
-
-        # Optional learned cue embeddings that can be injected at t=0
-        # (instead of using only SOS_TOKEN embedding).
-        self.n_cues = int(n_cues)
-        self.cue_emb = nn.Embedding(self.n_cues, token_embed_dim)
+        self.ego_emb = nn.Embedding(N_TOKENS, ego_embed_dim)
+        self.pos_emb = nn.Embedding(N_POS_TOKENS, pos_embed_dim)
 
         self.ca3 = nn.GRU(
-            input_size=token_embed_dim,
+            input_size=ego_embed_dim + pos_embed_dim,
             hidden_size=ca3_hidden_dim,
             num_layers=num_gru_layers,
             batch_first=True,
             dropout=(dropout if num_gru_layers > 1 else 0.0),
         )
-
-        self.readout = nn.Linear(ca3_hidden_dim, N_NODES)
-
-        self.num_gru_layers = num_gru_layers
-        self.ca3_hidden_dim = ca3_hidden_dim
+        self.readout = nn.Linear(ca3_hidden_dim, N_POS)
 
     def forward(
         self,
-        tokens: torch.LongTensor,         # (B,T)
+        ego_tokens: torch.LongTensor,      # (B,T)
+        pos_tokens: torch.LongTensor,      # (B,T)
         *,
-        cue_id: int = 0,
-        lengths: Optional[torch.LongTensor] = None,  # (B,) optional
+        lengths: Optional[torch.LongTensor] = None,
         return_hidden: bool = False,
     ) -> torch.Tensor | Tuple[torch.Tensor, torch.Tensor]:
-        """
-        tokens include SOS at t=0 ideally.
-        If cue_id is used, we override the embedding at t=0 with a learned cue embedding.
-        """
-        if tokens.dim() != 2:
-            raise ValueError(f"tokens must be (B,T), got {tokens.shape}")
-        B, T = tokens.shape
-        if not (0 <= cue_id < self.n_cues):
-            raise ValueError(f"cue_id must be in [0,{self.n_cues-1}]")
+        if ego_tokens.shape != pos_tokens.shape:
+            raise ValueError(f"ego_tokens and pos_tokens must have same shape, got {ego_tokens.shape} vs {pos_tokens.shape}")
+        if ego_tokens.dim() != 2:
+            raise ValueError(f"tokens must be (B,T), got {ego_tokens.shape}")
 
-        x = self.token_emb(tokens)  # (B,T,E)
+        x_ego = self.ego_emb(ego_tokens)   # (B,T,E1)
+        x_pos = self.pos_emb(pos_tokens)   # (B,T,E2)
+        x = torch.cat([x_ego, x_pos], dim=-1)
 
-        # Override the first time step embedding with cue embedding (retrieval cue).
-        # This is the "handle" you can use later to mismatch.
-        cue_vec = self.cue_emb(torch.tensor([cue_id], device=tokens.device)).view(1, 1, -1)  # (1,1,E)
-        x[:, 0:1, :] = cue_vec.expand(B, 1, -1)
-
-        # If you want to ignore PAD tokens properly, use packing when lengths is provided.
         if lengths is not None:
             packed = nn.utils.rnn.pack_padded_sequence(
                 x, lengths.cpu(), batch_first=True, enforce_sorted=False
             )
             out_packed, hT = self.ca3(packed)
-            out, _ = nn.utils.rnn.pad_packed_sequence(out_packed, batch_first=True, total_length=T)
+            out, _ = nn.utils.rnn.pad_packed_sequence(out_packed, batch_first=True, total_length=x.shape[1])
         else:
-            out, hT = self.ca3(x)  # out: (B,T,H)
+            out, hT = self.ca3(x)          # out: (B,T,H)
 
-        logits = self.readout(out)  # (B,T,144)
+        logits = self.readout(out)         # (B,T,288)
         if return_hidden:
             return logits, hT
         return logits
 
     def forward_with_latents(
         self,
-        tokens: torch.LongTensor,         # (B,T)
+        ego_tokens: torch.LongTensor,
+        pos_tokens: torch.LongTensor,
         *,
-        cue_id: int = 0,
-        lengths: torch.LongTensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        Returns
-        -------
-        logits : (B,T,144)
-        h_seq  : (B,T,H)   hidden state at each time step (latent trajectory)
-        hT     : (L,B,H)   final hidden state (per layer)
-        """
-        B, T = tokens.shape
-
-        x = self.token_emb(tokens)  # (B,T,E)
-
-        # cue override (only if you kept cues)
-        if getattr(self, "n_cues", 0) > 0:
-            if not (0 <= cue_id < self.n_cues):
-                raise ValueError(f"cue_id must be in [0,{self.n_cues-1}]")
-            cue_vec = self.cue_emb(torch.tensor([cue_id], device=tokens.device)).view(1, 1, -1)
-            x[:, 0:1, :] = cue_vec.expand(B, 1, -1)
+        lengths: Optional[torch.LongTensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return logits, h_seq, hT."""
+        if ego_tokens.shape != pos_tokens.shape:
+            raise ValueError("ego_tokens and pos_tokens must have same shape.")
+        x = torch.cat([self.ego_emb(ego_tokens), self.pos_emb(pos_tokens)], dim=-1)
 
         if lengths is not None:
             packed = nn.utils.rnn.pack_padded_sequence(
                 x, lengths.cpu(), batch_first=True, enforce_sorted=False
             )
             out_packed, hT = self.ca3(packed)
-            h_seq, _ = nn.utils.rnn.pad_packed_sequence(out_packed, batch_first=True, total_length=T)
+            h_seq, _ = nn.utils.rnn.pad_packed_sequence(out_packed, batch_first=True, total_length=x.shape[1])
         else:
-            h_seq, hT = self.ca3(x)  # h_seq: (B,T,H)
+            h_seq, hT = self.ca3(x)
 
-        logits = self.readout(h_seq)  # (B,T,144)
+        logits = self.readout(h_seq)
         return logits, h_seq, hT
 
     @torch.no_grad()
-    def predict_belief(
+    def predict_belief_xy(
         self,
         ego_actions: np.ndarray,
         *,
-        cue_id: int = 0,
+        cue_xy: Tuple[int, int] = (0, 0),
         device: Optional[torch.device] = None,
     ) -> np.ndarray:
         """
-        Returns belief over nodes at each time step: shape (T,144).
+        Returns belief grid: (T, NYBIN, NXBIN).
         """
         self.eval()
         device = device or next(self.parameters()).device
 
-        tokens = sanitize_ego_tokens(ego_actions)
-        tokens_t = torch.as_tensor(tokens[None, :], dtype=torch.long, device=device)  # (1,T)
-        logits = self.forward(tokens_t, cue_id=cue_id)  # (1,T,144)
-        belief = torch.softmax(logits, dim=-1)
-        return belief.squeeze(0).cpu().numpy().astype(np.float32)
+        ego = sanitize_ego_tokens(ego_actions)
+        T = len(ego)
+
+        # pos_tokens: only provide cue at t=0
+        x0, y0 = cue_xy
+        pos0 = xy_to_pos_id(x0, y0)
+        pos_tokens = np.full((T,), PAD_POS_TOKEN, dtype=np.int64)
+        pos_tokens[0] = pos0
+
+        ego_t = torch.as_tensor(ego[None, :], dtype=torch.long, device=device)
+        pos_t = torch.as_tensor(pos_tokens[None, :], dtype=torch.long, device=device)
+
+        logits = self.forward(ego_t, pos_t)        # (1,T,288)
+        belief = torch.softmax(logits, dim=-1)     # (1,T,288)
+        belief_grid = belief.view(1, T, NYBIN, NXBIN)
+        return belief_grid.squeeze(0).cpu().numpy().astype(np.float32)
 
     @torch.no_grad()
-    def predict_map_nodes(
+    def predict_map_xy(
         self,
         ego_actions: np.ndarray,
         *,
-        cue_id: int = 0,
+        cue_xy: Tuple[int, int] = (0, 0),
         device: Optional[torch.device] = None,
     ) -> np.ndarray:
         """
-        Returns MAP node id (1..144) at each time step: shape (T,).
+        Returns MAP (x,y) for each time step: shape (T,2), integers.
         """
-        belief = self.predict_belief(ego_actions, cue_id=cue_id, device=device)  # (T,144)
-        map_idx0 = belief.argmax(axis=-1)  # 0..143
-        return (map_idx0 + 1).astype(np.int64)
+        belief_grid = self.predict_belief_xy(ego_actions, cue_xy=cue_xy, device=device)  # (T,NY,NX)
+        flat = belief_grid.reshape(len(belief_grid), -1)  # (T,288)
+        pos_id = flat.argmax(axis=-1)                     # (T,)
+        xy = np.stack([pos_id % NXBIN, pos_id // NXBIN], axis=-1).astype(np.int64)
+        return xy
 
-@torch.no_grad()
-def retrieve_with_latents(
-    model: CA3BeliefAgent,
-    ego_actions: np.ndarray,
-    *,
-    cue_id: int = 0,
-    device: torch.device | None = None,
-):
-    model.eval()
-    device = device or next(model.parameters()).device
-
-    tokens = sanitize_ego_tokens(ego_actions)  # your function
-    tokens_t = torch.as_tensor(tokens[None, :], dtype=torch.long, device=device)  # (1,T)
-    
-    logits, h_seq, hT = model.forward_with_latents(tokens_t, cue_id=cue_id)
-
-    belief = torch.softmax(logits, dim=-1)  # (1,T,144)
-    return (
-        belief.squeeze(0).cpu().numpy(),   # (T,144)
-        h_seq.squeeze(0).cpu().numpy(),    # (T,H)   <-- latent state over time
-        hT.cpu().numpy(),                  # (L,1,H) final per-layer state
-    )
 
 # -----------------------------
 # Batching + loss
 # -----------------------------
 @dataclass
-class BeliefBatch:
-    tokens: torch.LongTensor   # (B,T) in {0..3,SOS,PAD}
-    targets: torch.LongTensor  # (B,T) in {0..143}  (node-1)
-    mask: torch.BoolTensor     # (B,T) valid positions
-    lengths: torch.LongTensor  # (B,) lengths (for packing)
+class XYBeliefBatch:
+    ego_tokens: torch.LongTensor     # (B,T)
+    pos_tokens: torch.LongTensor     # (B,T)  only t=0 is cue; rest PAD_POS_TOKEN
+    targets: torch.LongTensor        # (B,T)  pos_id in 0..287, padded = IGNORE_INDEX
+    mask: torch.BoolTensor           # (B,T)
+    lengths: torch.LongTensor        # (B,)
 
-
-def make_belief_batch(
+def make_xy_belief_batch(
     ego_batch: List[np.ndarray],
     node_batch: List[np.ndarray],
     *,
     device: torch.device,
-) -> BeliefBatch:
+    provide_full_pos_inputs: bool = False,
+) -> XYBeliefBatch:
     """
-    Build padded batch.
-
-    REQUIREMENT (recommended convention):
-      - tokens length equals nodes length
-      - first token corresponds to first node label
-      - first token should be -1 (SOS) in your data (or you can insert it upstream)
-
-    We pad tokens with PAD_TOKEN and targets with 0 (ignored via mask).
+    - ego_batch[i]: tokens length T_i (should include -1 at t=0 as SOS)
+    - node_batch[i]: node ids length T_i in 1..288 (or your concatenated scheme)
+    Inputs:
+      pos_tokens: either only cue at t=0 (default), or full positions if provide_full_pos_inputs=True
+    Targets:
+      flattened pos id (node-1), padded = IGNORE_INDEX
     """
     if len(ego_batch) != len(node_batch):
         raise ValueError("ego_batch and node_batch must have same length.")
+
     B = len(ego_batch)
     lengths = [len(e) for e in ego_batch]
     T_max = max(lengths)
 
-    tokens = torch.full((B, T_max), PAD_TOKEN, dtype=torch.long, device=device)
-    targets = torch.zeros((B, T_max), dtype=torch.long, device=device)
+    ego_tokens = torch.full((B, T_max), PAD_TOKEN, dtype=torch.long, device=device)
+    pos_tokens = torch.full((B, T_max), PAD_POS_TOKEN, dtype=torch.long, device=device)
+    targets = torch.full((B, T_max), IGNORE_INDEX, dtype=torch.long, device=device)
     mask = torch.zeros((B, T_max), dtype=torch.bool, device=device)
 
     for i, (ego, nodes) in enumerate(zip(ego_batch, node_batch)):
         ego = sanitize_ego_tokens(ego)
-        nodes = check_nodes(nodes)
+        nodes = np.asarray(nodes, dtype=np.int64)
         if len(ego) != len(nodes):
-            raise ValueError(
-                f"Sample {i} length mismatch: len(ego)={len(ego)} vs len(nodes)={len(nodes)}. "
-                "Make them aligned (same T)."
-            )
+            raise ValueError(f"Sample {i} length mismatch: len(ego)={len(ego)} vs len(nodes)={len(nodes)}")
 
         Ti = len(ego)
-        tokens[i, :Ti] = torch.from_numpy(ego).to(device=device)
-        targets[i, :Ti] = torch.from_numpy((nodes - 1).astype(np.int64)).to(device=device)
+        ego_tokens[i, :Ti] = torch.from_numpy(ego).to(device=device)
+
+        # targets are true positions (pos_id = node-1)
+        pos_ids = nodes_to_pos_ids(nodes)  # 0..287
+        targets[i, :Ti] = torch.from_numpy(pos_ids).to(device=device)
         mask[i, :Ti] = True
 
+        if provide_full_pos_inputs:
+            # feed true position at every time step (usually NOT what you want for retrieval)
+            pos_tokens[i, :Ti] = torch.from_numpy(pos_ids).to(device=device)
+        else:
+            # only provide the initial cue (x0,y0) at t=0
+            pos_tokens[i, 0] = int(pos_ids[0])
+
     lengths_t = torch.tensor(lengths, dtype=torch.long, device=device)
-    return BeliefBatch(tokens=tokens, targets=targets, mask=mask, lengths=lengths_t)
+    return XYBeliefBatch(
+        ego_tokens=ego_tokens,
+        pos_tokens=pos_tokens,
+        targets=targets,
+        mask=mask,
+        lengths=lengths_t,
+    )
 
-
-def masked_cross_entropy(
-    logits: torch.Tensor,        # (B,T,144)
-    targets: torch.Tensor,       # (B,T) in 0..143
-    mask: torch.BoolTensor,      # (B,T)
-) -> torch.Tensor:
+def ce_loss_positions(logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+    """
+    logits: (B,T,288)
+    targets: (B,T) with IGNORE_INDEX for padded positions
+    """
     B, T, C = logits.shape
-    logits2 = logits.reshape(B * T, C)
-    targets2 = targets.reshape(B * T)
-    mask2 = mask.reshape(B * T)
-
-    # standard CE per position, then mask
-    loss_all = F.cross_entropy(logits2, targets2, reduction="none")  # (B*T,)
-    loss = loss_all[mask2].mean()
-    return loss
+    return F.cross_entropy(
+        logits.view(B * T, C),
+        targets.view(B * T),
+        ignore_index=IGNORE_INDEX,
+    )
 
 
 # -----------------------------
 # Training loop
 # -----------------------------
-def train_belief_agent(
-    model: CA3BeliefAgent,
+def train_xy_belief_agent(
+    model: CA3XYBeliefAgent,
     ego_dataset: List[np.ndarray],
     node_dataset: List[np.ndarray],
     *,
@@ -327,19 +315,12 @@ def train_belief_agent(
     grad_clip: float = 1.0,
     device: Optional[torch.device] = None,
 ) -> None:
-    """
-    Supervised training:
-      input: ego tokens
-      target: true node id at each time step
-      loss: masked cross-entropy
-    """
     if len(ego_dataset) != len(node_dataset):
         raise ValueError("ego_dataset and node_dataset must have same length.")
 
     device = device or (torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu"))
     model.to(device)
     model.train()
-
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
 
     N = len(ego_dataset)
@@ -354,10 +335,10 @@ def train_belief_agent(
             ego_b = [ego_dataset[i] for i in batch_idx]
             nod_b = [node_dataset[i] for i in batch_idx]
 
-            batch = make_belief_batch(ego_b, nod_b, device=device)
+            batch = make_xy_belief_batch(ego_b, nod_b, device=device, provide_full_pos_inputs=False)
 
-            logits = model(batch.tokens, cue_id=0, lengths=batch.lengths)  # (B,T,144)
-            loss = masked_cross_entropy(logits, batch.targets, batch.mask)
+            logits = model(batch.ego_tokens, batch.pos_tokens, lengths=batch.lengths)  # (B,T,288)
+            loss = ce_loss_positions(logits, batch.targets)
 
             opt.zero_grad(set_to_none=True)
             loss.backward()
@@ -371,70 +352,39 @@ def train_belief_agent(
 
 
 # -----------------------------
-# Example: retrieval mismatch demo
+# Retrieval with latents
 # -----------------------------
 @torch.no_grad()
-def retrieval_mismatch_demo(
-    model: CA3BeliefAgent,
+def retrieve_with_latents_xy(
+    model: CA3XYBeliefAgent,
     ego_actions: np.ndarray,
-    true_nodes: np.ndarray,
     *,
-    cue_id_test: int,
+    cue_xy: Tuple[int, int] = (0, 0),
     device: Optional[torch.device] = None,
-) -> None:
+):
     """
-    Show how belief behaves when you use a mismatched cue_id.
-    Prints:
-      - MAP node at a few time points
-      - probability assigned to true node over time (summary)
+    Returns:
+      belief_grid: (T, NYBIN, NXBIN)
+      h_seq:       (T, H)
+      hT:          (L, 1, H)
     """
+    model.eval()
     device = device or next(model.parameters()).device
-    belief = model.predict_belief(ego_actions, cue_id=cue_id_test, device=device)  # (T,144)
-    map_nodes = belief.argmax(axis=-1) + 1  # (T,)
 
-    true_nodes = check_nodes(true_nodes)
-    true_idx0 = (true_nodes - 1).astype(np.int64)
-    p_true = belief[np.arange(len(true_nodes)), true_idx0]
+    ego = sanitize_ego_tokens(ego_actions)
+    T = len(ego)
 
-    print("time | MAP_node | true_node | p(true)")
-    for t in np.linspace(0, len(true_nodes) - 1, num=min(10, len(true_nodes)), dtype=int):
-        print(f"{t:4d} | {map_nodes[t]:8d} | {true_nodes[t]:9d} | {p_true[t]:.3f}")
+    pos_tokens = np.full((T,), PAD_POS_TOKEN, dtype=np.int64)
+    pos_tokens[0] = xy_to_pos_id(*cue_xy)
 
-    print(f"\nmean p(true) = {float(np.mean(p_true)):.3f}")
-    print(f"final p(true) = {float(p_true[-1]):.3f}")
+    ego_t = torch.as_tensor(ego[None, :], dtype=torch.long, device=device)
+    pos_t = torch.as_tensor(pos_tokens[None, :], dtype=torch.long, device=device)
 
+    logits, h_seq, hT = model.forward_with_latents(ego_t, pos_t)
+    belief = torch.softmax(logits, dim=-1).view(1, T, NYBIN, NXBIN)
 
-if __name__ == "__main__":
-    from rtrv_models.MazeExplorer.graph import MazeEnv, maze1_graph
-
-    # Example trajectory nodes (start fixed at node 1)
-    train_nodes = np.array([1,13,14,26,27,15,3,4,5,6,18,17,29,30,31,19,20,21,9,10,11,12,24,23,22,34,33,32,44,45,46,47,48,60,59,58,57,56,68,69,70,71,72,84,83,95,94,82,81,80,92,104,103,91,90,78,79,67,55,54,66,65,64,63,75,74,62,50,51,39,38,37,49,61,73,85,97,109,110,122,123,111,112,100,99,87,88,76,77,89,101,102,114,113,125,124,136,137,138,126,127,115,116,117,129,141,142,130,131,132,144],dtype = np.int64)
-    maze1 = MazeEnv(graph=maze1_graph, start_node=1, goal_node=144)
-    train_ego = maze1.to_ego_actions(train_nodes)
-    
-    train_nodes_m2 = np.array([1,2,14,13,25,37,49,61,73,74,86,85,97,98,110,109,121,133,134,135,123,111,99,100,88,76,75,63,64,65,53,52,40,28,29,17,5,6,7,19,18,30,31,43,44,32,33,21,9,10,11,12,24,23,22,34,46,45,57,69,68,67,55,54,66,78,77,89,101,102,114,115,116,104,103,91,79,80,92,93,105,106,94,82,70,71,59,60,72,84,83,95,96,108,120,119,131,130,142,143,144], dtype = np.int64)
-    train_ego_m2 = maze1.to_ego_actions(train_nodes_m2)
-    
-    train_nodes = np.concatenate([train_nodes, train_nodes_m2+144])
-    train_ego = np.concatenate([train_ego, train_ego_m2])
-    
-    retrv_nodes = np.array([99,87,88,76,77,89,101,102,114,113,125,124,136,137,138,126,127,115,116,117,129,141,142,130,131,132,144], np.int64)
-    retrv_ego = maze1.to_ego_actions(retrv_nodes)
-
-    model = CA3BeliefAgent(token_embed_dim=32, ca3_hidden_dim=128, n_cues=1)
-
-    belief, h_seq, hT = retrieve_with_latents(model, retrv_ego, cue_id=0)
-    print(belief.shape)  # (T,144)
-    print(h_seq.shape)   # (T,H)
-    print(hT.shape)      # (L,1,H)
-
-    # Train on a tiny dataset
-    train_belief_agent(model, ego_dataset=[train_ego]*50, node_dataset=[train_nodes]*50, epochs=200, batch_size=128)
-
-    # Normal cue (cue_id=0)
-    print("\nNormal cue (cue_id=0):")
-    retrieval_mismatch_demo(model, train_ego, train_nodes, cue_id_test=0)
-
-    # Mismatched cue (cue_id=1) -- this is your "wrong initialization" handle
-    print("\nMismatched cue (cue_id=1):")
-    retrieval_mismatch_demo(model, retrv_ego, retrv_nodes, cue_id_test=0)
+    return (
+        belief.squeeze(0).cpu().numpy().astype(np.float32),
+        h_seq.squeeze(0).cpu().numpy().astype(np.float32),
+        hT.cpu().numpy(),
+    )
