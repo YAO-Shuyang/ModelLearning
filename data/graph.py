@@ -127,11 +127,11 @@ def check_ego_relation(
     forward_mask = np.sum(np.abs(F @ avec_1.T - avec_2.T), axis=0) == 0
     backward_mask = np.sum(np.abs(B @ avec_1.T - avec_2.T), axis=0) == 0
     
-    ego_actions[left_mask] = 0
-    ego_actions[forward_mask] = 1
-    ego_actions[right_mask] = 2
-    ego_actions[backward_mask] = 3
-    return np.concatenate(([-1], ego_actions, np.array([-1])))
+    ego_actions[left_mask] = 1
+    ego_actions[forward_mask] = 2
+    ego_actions[right_mask] = 3
+    ego_actions[backward_mask] = 4
+    return np.concatenate(([0], ego_actions, np.array([5])))
     
 class MazeEnv(object):
     def __init__(
@@ -197,9 +197,17 @@ class MazeEnv(object):
         return next_node
     
     def to_all_actions(self, nodes_sequences: np.ndarray[np.int64]):
-        """Transform node sequences to action sequences."""
+        """Transform node sequences to action sequences.
+        
+        Actions include:
+        0: North
+        1: East
+        2: South
+        3: West
+        4: Goal Reached
+        """
         actions = check_relation(nodes_sequences[:-1], nodes_sequences[1:])
-        return np.append(actions, [-1])
+        return np.append(actions, [4])
     
     def to_ego_actions(self, nodes_sequences: np.ndarray[np.int64]):
         """
@@ -207,11 +215,12 @@ class MazeEnv(object):
         
         Ego_Types:
         
-        0: Left Turn
-        1: Forward
-        2: Right Turn
-        3: Backward (Turn around)
-        
+        0: Start Moving
+        1: Left Turn
+        2: Forward
+        3: Right Turn
+        4: Backward (Turn around)
+        5: Goal Reached
         """
         actions = check_relation(nodes_sequences[:-1], nodes_sequences[1:])
         action_vec = to_action_vec(actions)
