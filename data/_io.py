@@ -2,6 +2,8 @@ import pickle
 import numpy as np
 import os
 
+SAVE_DIR = os.path.dirname(__file__)
+
 def load_data(mouse: int, parad: str = "DSP") -> dict[str, np.ndarray]:
     """Load data for a given mouse and paradigm.
     

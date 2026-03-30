@@ -31,7 +31,7 @@ class PreprocessedData:
             == len(self.ego_act_test) == len(self.obs_test)
         )
         
-    def lap_train_durs(self) -> tuple[np.ndarray, np.ndarray]:
+    def get_lap_dur_train(self) -> tuple[np.ndarray, np.ndarray]:
         """Calculate the begin and end indexes of each lap in the training data.
         
         Returns
@@ -45,7 +45,7 @@ class PreprocessedData:
         beg, end = np.concatenate(([0], dlap)), np.concatenate((dlap, [len(self.lap_train)]))
         return beg, end
     
-    def lap_test_durs(self) -> tuple[np.ndarray, np.ndarray]:
+    def get_lap_dur_test(self) -> tuple[np.ndarray, np.ndarray]:
         """Calculate the begin and end indexes of each lap in the testing data.
         
         Returns
@@ -192,7 +192,9 @@ def preprocess_data(mouse: int) -> PreprocessedData:
     for b, e in zip(beg, end):
         all_act_test.append(MAZE1.to_all_actions(data_test['Nodes'][b:e]))
         ego_act_test.append(MAZE1.to_ego_actions(data_test['Nodes'][b:e]))
-        obs_test.append(MAZE1.obs[data_test['Nodes'][b:e]-1].astype(np.int64))
+        dsp_obs = MAZE1.obs[data_test['Nodes'][b:e]-1].astype(np.int64)
+        dsp_obs[0] = 1  # Starting node
+        obs_test.append(dsp_obs)
         
     all_act_test = np.concatenate(all_act_test, dtype=np.int64)
     ego_act_test = np.concatenate(ego_act_test, dtype=np.int64)
