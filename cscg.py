@@ -88,7 +88,7 @@ class CSCG(BaseModel):
         act_test: np.ndarray[np.int64]
     ) -> np.ndarray[np.int64]:
         """Predict the latent state based on the test observations and actions."""
-        return self.model.decode(obs_test, act_test)[0].astype(np.int64)
+        return self.model.decode(obs_test, act_test)[1].astype(np.int64)
     
     def predict_with_plasticity(
         self,
@@ -99,7 +99,7 @@ class CSCG(BaseModel):
         allowing for plasticity (i.e., updating the model parameters based on 
         the test data)."""
         self.model.learn_em_T(x=obs_test, a=act_test, n_iter=10, term_early=True)
-        return self.model.decode(obs_test, act_test)[0].astype(np.int64)
+        return self.model.decode(obs_test, act_test)[1].astype(np.int64)
     
     def predict_prob(
         self, 
@@ -108,7 +108,7 @@ class CSCG(BaseModel):
     ) -> np.ndarray[np.float64]:
         """Predict the state probabilities/likelihoods based on the test observations 
         and actions."""
-        return self.model.decode(obs_test, act_test)[1].astype(np.float64)
+        return self.model.decode(obs_test, act_test)[0].astype(np.float64)
     
     def retrieve(
         self, 

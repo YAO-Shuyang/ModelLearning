@@ -5,14 +5,14 @@ from typing import Optional
 class CANN_PI:
     def __init__(
         self, nn: int = 1000, # number of neurons in the network
-        n_sens: int = 111, # number of hidden states
+        n_hid: int = 111, # number of hidden states
         sigma: float = 3.0, # width of the Gaussian function for recurrent weights,
         tau: float = 10, # time constant for the network dynamics,
         retriv_thre: float = 0.2, 
         epsilon: float = 0.1 # noise level for initial state
     ):
         self.nn = nn # number of neurons
-        self.n_sens = n_sens # number of hidden states
+        self.n_hid = n_hid # number of hidden states
         self.sigma = sigma
         self.tau = tau
         self.epsilon = epsilon
