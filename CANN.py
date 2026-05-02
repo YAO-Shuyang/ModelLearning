@@ -1,5 +1,6 @@
 import numpy as np
 from typing import Optional
+from tqdm import tqdm
 
 # CANN PI-Driven
 class CANN_PI:
@@ -9,32 +10,60 @@ class CANN_PI:
         sigma: float = 3.0, # width of the Gaussian function for recurrent weights,
         tau: float = 10, # time constant for the network dynamics,
         retriv_thre: float = 0.2, 
-        epsilon: float = 0.1 # noise level for initial state
+        dt: float = 0.1,
+        epsilon: float = 0.1, # noise level for initial state,
+        J1: float = 0.05, # strength of the global inhibition,
+        eta: float = 0.01 # learning rate for Hebbian plasticity
     ):
         self.nn = nn # number of neurons
         self.n_hid = n_hid # number of hidden states
         self.sigma = sigma
         self.tau = tau
+        self.dt = dt
         self.epsilon = epsilon
-        self.W0 = self._create_weight_matrix()
-        self.WI = np.eye(self.nn) # identity matrix for sensory input weights
-        # shuffle the rows to create a new mapping
-        self.WS = np.random.permutation(np.eye(self.nn), axis=0) 
-        self.r = self._generate_tuning_curve()
+        self.J1 = J1
+        self.fit()
+        self.WI = np.eye(self.nn) # input matrix
         self.rtv_thre = retriv_thre
+        self.eta = eta
+
         
         # initial state of the network based on the tuning curve and some noise
-        self.u0 = self.r[:, 0] + np.random.normal(0, self.epsilon, self.nn) 
-        self.b = 0 # initial belief state (can be updated based on the network activity)
-        self.p = 0 # initial retrieval probability (can be updated based on the belief state)
-        self.u = self.u0.copy()
-        self.u_rec = None # to store the recurrent states over time for analysis
-        self.corr_rec = None # to store correlation values over time for analysis
-        self.belief_rec = None # to store belief states over time for analysis
+        self.reset()
     
-    def update_w0(self):
-        self.W0 += self.WS @ self.r # update W0 based on the shuffled tuning curves
-        self.W0 = self.W0 / np.max(self.W0) # normalize weights to
+    def R(self, x: float) -> np.ndarray:
+        y = np.exp((-(self.T[:, 0] - x)**2) / (2 * self.sigma**2)) * self.T[:, 1]
+        return y
+    
+    def fit(self, s: Optional[np.ndarray] = None, a: Optional[np.ndarray] = None):
+        """create a stored attractor map
+        Weights of CANN are preconfigured and no fitting required. 
+        This method is a placeholder to maintain consistency with other models."""
+        self._generate_tuning_curve()
+        self.W0 = self._create_weight_matrix()
+    
+    def recruite(self, n: int, x: float):
+        assert 0 <= n < self.nn
+        assert 0 <= x < self.n_hid
+        self.T[n, 0] = x
+        self.T[n, 1] = 1
+    
+    def is_retriev(self, u: np.ndarray, x: float):
+        """Determine retrieval of a stored attractor given the current network 
+        state u and target attractor x.
+        
+        Returns
+        -------
+        pr : float
+            Pearson correlation (r) between the current network state u and the 
+            stored attractor x.
+        b : float, [0, 1]
+            Retrieval score normalized to [0, 1] based on the correlation,
+            determined by a sigmoid function of the correlation.
+        """
+        pr = np.corrcoef(u, self.R(x))[0, 1]
+        b = 1 / (1 + np.exp(-10 * (pr - self.rtv_thre)))
+        return pr, b
     
     def _create_weight_matrix(self) -> np.ndarray:
         """Constructs recurrent weigths depending on sensory sequences.
@@ -45,125 +74,150 @@ class CANN_PI:
             Recurrent weight matrix of shape (nn, nn).
         """
         W = np.zeros((self.nn, self.nn))
-        for i in range(self.nn):
-            for j in range(self.nn):
-                distance = j-i
-                W[i, j] = np.exp(-distance**2 / (2 * self.sigma**2))
-        W = W / np.max(W) # normalize weights to [0, 1]
+        n_recruited = self.n_recruited
+        idx = np.ix_(n_recruited, n_recruited)
+        dist_mat = np.abs(np.subtract.outer(n_recruited, n_recruited))
+        W[idx] = np.exp(-dist_mat**2 / (2 * self.sigma**2)) 
+        W = W / np.max(W) * (1+self.J1) # normalize weights to [0, 1]
+        W -= self.J1 # apply global inhibition
         return W
     
-    def _generate_tuning_curve(self) -> np.ndarray:
+    def _generate_tuning_curve(self):
         """Generates tuning curves for each neuron based on the weight matrix.
+        Field centers + Amplitudes.
+        """
+        self.T = np.zeros((self.nn, 2))
+        n_recruited = np.random.choice(np.arange(0, self.nn), size=self.n_hid, replace=False)
+        assert np.unique(n_recruited).shape[0] == self.n_hid
+        
+        self.T[n_recruited, 0] = np.arange(self.n_hid)
+        self.T[n_recruited, 1] = 1
+        self.n_recruited = n_recruited
+    
+    def reset(self):
+        # initial state of the network based on the tuning curve and some noise
+        self.u0 = self.R(0) + np.random.normal(0, self.epsilon, self.nn) 
+        self.WI = np.eye(self.nn)
+        self.WP = np.eye(self.nn)[np.random.permutation(self.nn), :]
+        self.W = self.WI.copy()
+        
+    def update_W(self, b: float):
+        """Update WI based on the retrieval belief b"""
+        assert b >= 0 and b <= 1
+        self.W = b * self.WI + (1 - b) * self.WP
+        
+    def update_W0(self, u_rec: np.ndarray):
+        """Update W0 based on the retrieval belief b"""
+        max_fire_neuron = np.argmax(u_rec, axis=0)
+        max_fire_neuron = np.argmax(u_rec)
+        dts = np.ones(u_rec.shape[1])
+        cum_dts = np.cumsum(dts)
+        if max_fire_neuron is not None:
+            self.W0[max_fire_neuron, :] += self.eta * self.R(self.u[max_fire_neuron])
 
-        Returns
-        -------
-        tuning_curves : np.ndarray
-            Tuning curves of shape (nn, nn).
-        """
-        tuning_curves = np.zeros((self.nn, self.nn))
-        for i in range(self.nn):
-            tuning_curves[i] = self.W[i] / np.sum(self.W[i])
-        return tuning_curves
     
-    def fit(self, s: Optional[np.ndarray] = None, a: Optional[np.ndarray] = None):
-        """
-        Weights of CANN are preconfigured and no fitting required. 
-        This method is a placeholder to maintain consistency with other models.
-        """
-        self._create_weight_matrix()
-    
-    def predict(self, s: np.ndarray[int]) :
+    def predict(self, s: np.ndarray[float], is_plastic: bool = False):
         """Predicts the next state of the network given the current sensory input.
 
         Parameters
         ----------
-        s : np.ndarray[int]
-            Current sensory state inputs of shape (n_L,), where n_L is the length 
+        s : np.ndarray[float]
+            Current sensory state inputs of shape (n,), where n is the length 
             of the sequence of sensory inputs.
 
         Returns
         -------
-        np.ndarray[int]
+        np.ndarray[float]
             Next state of the network of shape (nn,).
         """
         self.reset()
         # initial belief state is certain about the first sensory input
-        u_rec = np.zeros((self.nn, len(s)+1))
-        b_rec = np.zeros((self.nn, len(s)+1))
-        p_rec = np.zeros((self.nn, len(s)+1))
-        u_rec[:, 0] = self.u
+        u_rec = np.zeros((self.nn, len(s)))
+        b_rec = np.zeros(len(s))
+        pr_rec = np.zeros(len(s))
+        u_rec[:, 0] = self.u0
+        pr_rec[0], b_rec[0] = self.is_retriev(self.u0, s[0])
         
         for t in range(1, len(s)):
-            self.u = 1/self.tau * (-self.u + self.WI @ self.W0 @ self.r[:, s[t]])
-            u_rec[:, t+1] = self.u
+            self.u = self.u + self.dt * 1/self.tau * (-self.u + self.W0 @ self.W @ self.R(s[t]))
+            u_rec[:, t] = self.u
+            pr, b = self.is_retriev(self.u, s[t])
+            pr_rec[t] = pr
+            b_rec[t] = b
+            self.update_W(b)
+            if is_plastic:
+                self.update_W0()
 
-        self.u_rec = u_rec 
-        return self.u_rec
+        return u_rec, b_rec, pr_rec
+        
+    def predict_many_trials(
+        self,
+        s: np.ndarray[float],
+        n_trials: int,
+        is_plastic: bool = False
+    ):
+        self.reset()
+        u_rec = np.zeros((self.nn, len(s), n_trials))
+        b_rec = np.zeros((len(s), n_trials))
+        pr_rec = np.zeros((len(s), n_trials))
+        u0 = self.u0.copy()
+        u_rec[:, 0, :] = u0[:, None]
+        pr_rec[0, :] , b_rec[0, :] = self.is_retriev(u0, s[0])
+
+        for n in tqdm(range(n_trials)):
+            self.u = u0.copy()
+            for t in range(1, len(s)):
+                self.u = self.u + self.dt * 1/self.tau * (-self.u + self.W @ self.W0 @ self.R(s[t])) + np.random.normal(0, self.epsilon, self.nn)
+                u_rec[:, t, n] = self.u
+                pr, b = self.is_retriev(self.u, s[t])
+                pr_rec[t, n] = pr
+                b_rec[t, n] = b
+                self.update_W(b)
+                if is_plastic:
+                    self.update_W0()
+            
+        return u_rec, b_rec, pr_rec
     
-    def step(self, s_curr: int, s_next: int):
-        """Performs one step of the network dynamics given the current sensory input.
-
-        Parameters
-        ----------
-        s_curr : int
-            Current sensory state input at time t.
-        s_next : int
-            Next sensory state input at time t+1.
-
-        Returns
-        -------
-        np.ndarray[int]
-            Updated state of the network of shape (nn,).
-        """
-        self.u = 1/self.tau * (-self.u + self.W @ self.r[:, s_curr] + self.r[:, s_next])
-        p_dis = self.calc_softmax_belief(self.u) # update belief state based on the current state of the network
-        self.b = np.argmax(p_dis) # update belief state based on the current state of the network
-        self.p = np.max(p_dis) # update retrieval probability based on the current state of the network
-        return
+    def visualize_energy_landscape(
+        self
+    ):
+        pass
     
-    def calc_softmax_belief(self, u: np.ndarray, beta: float = 10.0) -> np.ndarray:
-        """
-        Convert current CANN activity into a probability distribution over locations.
-        Correlation between current state and each stored attractor pattern
-        is computed, and then transformed into a probability distribution using 
-        a softmax function.
-
-        Parameters
-        ----------
-        u : np.ndarray
-            Current network state, shape (nn,)
-        beta : float
-            Inverse temperature for softmax. Larger beta -> sharper belief.
-
-        Returns
-        -------
-        belief : np.ndarray
-            Probability over candidate locations, shape (nn,)
-        """
-        scores = np.zeros(self.nn)
-
-        templates = np.vstack([self.u, self.r.T]) # shape (nn, nn+1)
-        # Row-wise correlation of u with each template (the first row is u, the rest are templates)
-        scores = np.corrcoef(templates)[0, 1:] # correlation of u with each template
-
-        # handle NaNs safely
-        scores = np.nan_to_num(scores, nan=-1.0)
-
-        # softmax with numerical stabilization
-        z = beta * scores
-        z = z - np.max(z)
-        exp_z = np.exp(z)
-        belief = exp_z / np.sum(exp_z)
-
-        self.corr_rec = scores
-        self.belief_rec = belief
-        return belief
+if __name__ == "__main__":
+    import matplotlib.pyplot as plt
+    import seaborn as sns
+    from sklearn.decomposition import PCA
     
-    def reset(self):
-        self.u0 = self.r[:, 0] + np.random.normal(0, self.epsilon, self.nn)
-        self.u = self.u0.copy()
-        self.b = 0 # initial belief state (can be updated based on the network activity)
-        self.p = 0 # initial retrieval probability (can be updated based on the belief state)
-        self.u_rec = None # to store the recurrent states over time for analysis
-        self.b_rec = None # to store belief states over time for analysis
-        self.p_rec = None # to store retrieval probabilities over time for analysis
+    model = CANN_PI(nn=1000, n_hid=111, sigma=3.0, dt=0.2, tau=2, epsilon=0.05, retriv_thre=0.3)
+    u_rec, b_rec, pr_rec = model.predict_many_trials(
+        s = np.linspace(10, 110, 500),
+        n_trials=10,
+        is_plastic=False
+    )
+    plt.figure(figsize=(6, 3))
+    color = sns.color_palette("rainbow", n_colors=u_rec.shape[2])
+    for n in range(u_rec.shape[2]):
+        plt.plot(pr_rec[:, n], color=color[n])
+    plt.ylim(-0.1, 1)
+    plt.show()
+    
+    plt.figure(figsize=(4, 3))
+    ax = plt.subplot(111, projection='3d')
+    pca = PCA(n_components=3)
+    u_rec_3d = pca.fit(u_rec.reshape(u_rec.shape[0], -1).T)
+    for n in range(u_rec.shape[2]):
+        u_rec_trial = u_rec[:, :, n].T
+        u_rec_3d = pca.transform(u_rec_trial)
+        ax.plot(u_rec_3d[:, 0], u_rec_3d[:, 1], u_rec_3d[:, 2], c=color[n])
+    plt.show()
+
+    plt.figure(figsize=(4, 3))
+    ax = plt.subplot(111, projection='3d')
+    standard = np.vstack([model.R(s) for s in np.linspace(10, 110, 500)]).T
+    standard_3d = pca.fit_transform(standard.T)
+    ax.plot(standard_3d[:, 0], standard_3d[:, 1], standard_3d[:, 2], c='k')
+    for n in range(u_rec.shape[2]):
+        u_rec_trial = u_rec[:, :, n].T
+        u_rec_3d = pca.transform(u_rec_trial)
+        ax.plot(u_rec_3d[:, 0], u_rec_3d[:, 1], u_rec_3d[:, 2], c=color[n])
+    plt.show()

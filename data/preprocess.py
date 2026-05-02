@@ -12,9 +12,11 @@ class PreprocessedData:
     all_act_train: np.ndarray[np.int64]
     ego_act_train: np.ndarray[np.int64]
     obs_train: np.ndarray[np.int64]
+    maze_train: np.ndarray[np.int64]
     
     lap_test: np.ndarray[np.int64]
     route_test: np.ndarray[np.int64]
+    session_test: np.ndarray[np.int64]
     pos_test: np.ndarray[np.int64]
     all_act_test: np.ndarray[np.int64]
     ego_act_test: np.ndarray[np.int64]
@@ -90,6 +92,18 @@ class PreprocessedData:
         else:
             raise ValueError(f"Invalid mode {mode}. Choose 'all' or 'ego'.")
         return act, obs
+    
+    def get_ideal_seq_with_pos(self, rt: int, mode: str = "all"):
+        pos = CP_DSP1[rt].astype(np.int64)
+        obs = self.env.obs[pos - 1].astype(np.int64)
+
+        if mode == "all":
+            act = self.env.to_all_actions(pos)
+        elif mode == "ego":
+            act = self.env.to_ego_actions(pos)
+        else:
+            raise ValueError(f"Invalid mode {mode}.")
+        return act, obs, pos
 
 
 def preprocess_data(mouse: int) -> PreprocessedData:
@@ -188,6 +202,7 @@ def preprocess_data(mouse: int) -> PreprocessedData:
     obs_test = []
     
     dlap = np.where(np.diff(data_test['Lap']) != 0)[0]+1
+    session_test = data_test['Session']
     beg, end = np.concatenate(([0], dlap)), np.concatenate((dlap, [len(data_test['Lap'])]))
     for b, e in zip(beg, end):
         all_act_test.append(MAZE1.to_all_actions(data_test['Nodes'][b:e]))
@@ -207,8 +222,10 @@ def preprocess_data(mouse: int) -> PreprocessedData:
         all_act_train=all_act,
         ego_act_train=ego_act,
         obs_train=obs,
+        maze_train=data_train['Maze Type'].astype(np.int64),
         lap_test=data_test['Lap'],
         route_test=data_test['Route'],
+        session_test=data_test['Session'],
         pos_test=data_test['Nodes'],
         all_act_test=all_act_test,
         ego_act_test=ego_act_test,

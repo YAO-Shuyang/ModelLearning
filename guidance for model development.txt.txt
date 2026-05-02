@@ -1,0 +1,245 @@
+Please follows the following requirements when develop new models.
+
+1. Each model, if is relative complex, design the primary part of the model within a specific directory, and out of the directory, and then design an interface model class .py file that supports fit, fit_by_trial, predict, predict_prob, retrieve etc within the model interface class. An example case is: 
+"
+import numpy as np
+from dataclasses import dataclass
+from typing import Optional
+
+from rtrv_models.naturecomm_cscg.chmm_actions import CHMM
+from rtrv_models.base import BaseModel
+
+@dataclass
+class CSCG(BaseModel):
+    """A class re-encapsulates a CSCG (clone-structured cognitive graph) model 
+    for the convenience for standard testings and comparisons across different 
+    models.
+    
+    Attributes
+    ----------
+    n_clones : np.ndarray[np.int64]
+        Number of clones for each observation in the CSCG model.
+    act : Optional[np.ndarray[np.int64]]
+        Array of actions.
+    obs : Optional[np.ndarray[np.int64]]
+        Array of observations.
+    pos : Optional[np.ndarray[np.int64]]
+        Array of positions.
+    model : Optional[CHMM]
+        The underlying CHMM model.
+    """
+    n_clones: int
+    act: np.ndarray[np.int64]
+    obs: np.ndarray[np.int64]
+    pos: Optional[np.ndarray[np.int64]] = None
+    model: Optional[CHMM] = None
+    pseudocount: float = 1e-10
+    
+    def __post_init__(self):
+        self.model = CHMM(
+            self.n_clones, 
+            x=self.obs, 
+            a=self.act, 
+            pseudocount=self.pseudocount
+        )
+        assert self.obs.shape[0] == self.act.shape[0], \
+            f"Observation {self.obs.shape[0]} and action {self.act.shape[0]} "\
+            f"arrays must have the same length."
+    
+    def fit(self, n_iter: int = 100, term_early: bool = False) -> list[float]:
+        """Fit the CSCG model using the EM algorithm."""
+        progression = self.model.learn_em_T(
+            x=self.obs, 
+            a=self.act, 
+            n_iter=n_iter, 
+            term_early=term_early
+        )
+        return progression
+        
+    def fit_by_trial(
+        self, 
+        trial_beg: np.ndarray, 
+        trial_end: np.ndarray, 
+        n_iter: int = 100, 
+        term_early: bool = False
+    ):
+        """Fit the CSCG model using the EM algorithm, treating each sequence 
+        as a separate trial."""
+        assert np.max(trial_beg) <= self.obs.shape[0], \
+            f"Trial begin indices must be within the range of observations."
+        assert np.max(trial_end) <= self.obs.shape[0], \
+            f"Trial end indices must be within the range of observations."
+        
+        obs = [self.obs[beg:end] for beg, end in zip(trial_beg, trial_end)]
+        act = [self.act[beg:end] for beg, end in zip(trial_beg, trial_end)]
+        
+        i = 0
+        for obs_seq, act_seq in zip(obs, act):
+            if i % 20 == 0:
+                print(f"Processing trial {i}")
+
+            self.model.learn_em_T(
+                x=obs_seq, 
+                a=act_seq, 
+                n_iter=n_iter, 
+                term_early=term_early
+            )
+            i += 1
+            
+    def predict(
+        self, 
+        obs_test: np.ndarray[np.int64], 
+        act_test: np.ndarray[np.int64]
+    ) -> np.ndarray[np.int64]:
+        """Predict the latent state based on the test observations and actions."""
+        return self.model.decode(obs_test, act_test)[1].astype(np.int64)
+    
+    def predict_with_plasticity(
+        self,
+        obs_test: np.ndarray[np.int64],
+        act_test: np.ndarray[np.int64],
+    ):
+        """Predict the latent state based on the test observations and actions, 
+        allowing for plasticity (i.e., updating the model parameters based on 
+        the test data)."""
+        self.model.learn_em_T(x=obs_test, a=act_test, n_iter=10, term_early=True)
+        return self.model.decode(obs_test, act_test)[1].astype(np.int64)
+    
+    def predict_prob(
+        self, 
+        obs_test: np.ndarray[np.int64], 
+        act_test: np.ndarray[np.int64]
+    ) -> np.ndarray[np.float64]:
+        """Predict the state probabilities/likelihoods based on the test observations 
+        and actions."""
+        return self.model.decode(obs_test, act_test)[0].astype(np.float64)
+    
+    def retrieve(
+        self, 
+        obs_test: np.ndarray[np.int64], 
+        act_test: np.ndarray[np.int64],
+        obs_perf: np.ndarray[np.int64],
+        act_perf: np.ndarray[np.int64]
+    ) -> np.ndarray[np.int64]:
+        """Predict the positions based on the test observations and actions.
+        
+        Parameters
+        ----------
+        obs_test : np.ndarray[np.int64]
+            Array of test observations.
+        act_test : np.ndarray[np.int64]
+            Array of test actions.
+        obs_perf : np.ndarray[np.int64]
+            Array of observations for a perfect trial (e.g., the ideal sequence).
+        act_perf : np.ndarray[np.int64]
+            Array of actions for a perfect trial (e.g., the ideal sequence).
+            
+        Returns
+        -------
+        np.ndarray[np.int64]
+            Array indicating whether the predicted state matches the state from the 
+            perfect trial (1 for match, 0 for mismatch).
+        """
+        state_test = self.predict(obs_perf, act_perf)
+        state_pred = self.predict(obs_test, act_test)
+        return np.where(state_test - state_pred == 0, 1, 0)
+    
+    def retrieve_trial_avg(
+        self,
+        trial_beg: np.ndarray,
+        trial_end: np.ndarray,
+        obs_test: np.ndarray[np.int64],
+        act_test: np.ndarray[np.int64],
+        pos_test: np.ndarray[np.int64],
+        obs_perf: np.ndarray[np.int64],
+        act_perf: np.ndarray[np.int64],
+        n_pos_bin: int = 144
+    ):
+        """
+        Notes
+        -----
+        `pos_test` should be spatial bin ids starting from 1 to `n_pos_bin` (inclusive). 
+        The average retrieval is calculated for each spatial bin across all trials, and 
+        the final output is an array of average retrieval values for each spatial bin.\\
+            
+        Compute data of each route separately.
+        """
+        assert np.max(trial_beg) < self.obs.shape[0], \
+            f"Trial begin indices must be within the range of observations."
+        assert np.max(trial_end) < self.obs.shape[0], \
+            f"Trial end indices must be within the range of observations."
+        
+        avg_retrieval = np.zeros(n_pos_bin)
+        
+        for beg, end in zip(trial_beg, trial_end):
+            obs_test_trial = obs_test[beg:end]
+            act_test_trial = act_test[beg:end]
+            pos_test_trial = pos_test[beg:end]
+            
+            retrieval_trial = self.retrieve(
+                obs_test_trial, 
+                act_test_trial, 
+                obs_perf, 
+                act_perf
+            )
+            
+            for pos in range(1, n_pos_bin+1):
+                avg_retrieval[pos-1] += np.mean(retrieval_trial[pos_test_trial == pos])
+                
+        avg_retrieval /= len(trial_beg)
+        return avg_retrieval
+"
+
+2. Every model, if not specified elsewhere, should be trained by the real data. the training set and testing set can be uploaded like this one:
+"
+from rtrv_models.cscg import CSCG
+from rtrv_models.data.graph import MazeEnv, maze1_graph, check_relation, CP_DSP1, maze2_graph, get_metric
+from rtrv_models.data.preprocess import PreprocessedData, preprocess_data
+import numpy as np
+from rtrv_models.data._io import load_data, SAVE_DIR
+import pandas as pd
+import os
+import pickle
+
+DSPPalette = ["#A9CCE3", "#82C3C5", '#9C8FBC', "#D9A6A9", "#DCC8A4", '#647D91', "#C06C84"]
+
+maze1 = MazeEnv(maze1_graph)
+obs_counts1 = np.histogram(maze1.obs, range=(-0.5, 5.5), bins=6)
+print(obs_counts1)
+maze2 = MazeEnv(maze2_graph)
+obs_counts2 = np.histogram(maze2.obs, range=(-0.5, 5.5), bins=6)
+print(obs_counts2)
+
+n_clones = (np.mean(np.vstack([obs_counts1[0], obs_counts2[0]]), axis=0) * 6).astype(np.int64)
+print(n_clones)
+
+
+for mouse in [10212, 10224, 10227, 10232]:
+    print(f"Processing mouse {mouse}")
+    if os.path.exists(os.path.join(SAVE_DIR, f"cscg_{mouse}.pkl")):
+        print("  Existed, skip.")
+        continue
+
+    res: PreprocessedData = preprocess_data(mouse)
+    x = res.obs_train
+    a = res.all_act_train
+    beg_train, end_train = res.get_lap_dur_train()
+    is_maze1 = res.maze_train[beg_train] == 1
+
+    n_obs = 6
+    pseudocount = 1e-5
+    n_iters = 100
+
+    cscg = CSCG(n_clones=n_clones, act=a, obs=x, pseudocount=pseudocount)  # Initialize the model
+    cscg.fit_by_trial(trial_beg=beg_train[is_maze1], trial_end=end_train[is_maze1], n_iter=n_iters)
+    with open(os.path.join(SAVE_DIR, f"cscg_{mouse}.pkl"), "wb") as f:
+        pickle.dump(cscg, f)
+        
+    x_ego = res.obs_train
+    a_ego = res.ego_act_train
+    
+    cscg_ego = CSCG(n_clones=n_clones, act=a_ego, obs=x_ego, pseudocount=pseudocount)
+    cscg_ego.fit_by_trial(trial_beg=beg_train, trial_end=end_train, n_iter=n_iters)
+    with open(os.path.join(SAVE_DIR, f"cscg_{mouse}_ego.pkl"), "wb") as f:
+        pickle.dump(cscg_ego, f)
+"
